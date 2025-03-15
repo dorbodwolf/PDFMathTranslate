@@ -1,110 +1,133 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException,Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import StreamingResponse
-
+from fastapi.middleware.cors import CORSMiddleware
+from pdf2zh.doclayout import ModelInstance
 import json
 import io
-from io import BytesIO
+import tqdm
 import asyncio
 from pdf2zh import translate_stream
-import tqdm
-from pdf2zh.doclayout import ModelInstance
-from pdf2zh.config import ConfigManager
-
 import uuid
-
 import logging
+import requests  # 用于处理 URL 下载
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
-# 设置日志记录器
-logger = logging.getLogger("uvicorn")
 
-# 设置日志记录格式
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler = logging.StreamHandler()
-
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-
-# 禁用 Uvicorn 的日志传播，避免重复配置
-logger.propagate = False
+logger = logging.getLogger(__name__)
 
 # 初始化 FastAPI 应用
 app = FastAPI()
 
+# # 允许 CORS 访问（如果前端和后端端口不同）
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],  
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
 # 存储任务状态的简单方式
 tasks = {}
 
+# 下载 URL 对应的文件并返回文件对象
+def download_pdf(url: str) -> bytes:
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to download PDF")
+    return response.content
 
-# 异步翻译任务函数
+# async def translate_task(stream: bytes, args: dict):
+#     async def progress_bar(t: tqdm.tqdm):
+#         tasks[args.get("task_id")]["state"] = "IN_PROGRESS"
+#         tasks[args.get("task_id")]["progress"] = {
+#             "n": t.n,
+#             "total": t.total
+#         }
+#         logging.info(f"Translating {t.n} / {t.total} pages")
+
+#     # **确保 translate_stream 是异步的，并 await 它**
+#     doc_mono, doc_dual =  translate_stream(
+#         stream,
+#         # callback=progress_bar,
+#         model=ModelInstance.value,
+#         **args,
+#     )
+
+#     tasks[args.get("task_id")]["state"] = "SUCCESS"
+#     tasks[args.get("task_id")]["result"] = (doc_mono, doc_dual)
+
+# 异步任务：使用 run_in_executor 将同步的 translate_stream 放入后台线程池中执行
 async def translate_task(stream: bytes, args: dict):
-    """
-    异步翻译任务，使用 async/await 来避免阻塞
-    """
-    # 用于进度条的函数
+    loop = asyncio.get_running_loop()
+    
+    # 定义同步的 progress_bar 回调函数
     def progress_bar(t: tqdm.tqdm):
         task_id = args.get("task_id")
-        tasks[task_id]["state"] = "PROGRESS"
-        tasks[task_id]["info"] = f"Translating {t.n} / {t.total} pages"
-        print(f"Translating {t.n} / {t.total} pages")
-
-    # 执行翻译任务
-    doc_mono, doc_dual = translate_stream(
-        stream,
-        callback=progress_bar,
-        model=ModelInstance.value,
-        **args,
+        tasks[task_id]["state"] = "IN_PROGRESS"
+        tasks[task_id]["progress"] = {"n": t.n, "total": t.total}
+        logger.info(f"Translating {t.n} / {t.total} pages")
+    
+    # 显式传递必要的参数给 translate_stream
+    doc_mono, doc_dual = await loop.run_in_executor(
+        None,
+        lambda: translate_stream(
+            stream,
+            None,                     # pages: 默认传 None
+            args["lang_in"],
+            args["lang_out"],
+            args["service"],
+            args["thread"],
+            "",                       # vfont 默认空字符串
+            "",                       # vchar 默认空字符串
+            progress_bar,             # 回调
+            None,                     # cancellation_event
+            ModelInstance.value       # model
+        )
     )
-
-    tasks[args.get("task_id")]["state"] = "SUCCESS"
-    tasks[args.get("task_id")]["result"] = (doc_mono, doc_dual)
-
-@app.get("/")
-async def root():
-    logger.debug("This is a debug log!")
-    return {"message": "Welcome to the PDF Translator API!"}
+    
+    task_id = args.get("task_id")
+    tasks[task_id]["state"] = "SUCCESS"
+    tasks[task_id]["result"] = (doc_mono, doc_dual)
 
 @app.post("/v1/translate")
-async def create_translate_tasks(file: UploadFile = File(...), data: str = Form(...)):
-    """
-    接收文件并启动翻译任务
-    """
+async def create_translate_tasks(file: UploadFile = File(...), url: str = Form(...), data: str = Form(...)):
     try:
-         # 打印请求体内容以调试
+        # 获取文件内容
+        file_content = None
+        if url:
+            file_content = download_pdf(url)  # 下载 URL 对应的文件
+        elif file:
+            file_content = await file.read()  # 获取上传的文件内容
 
-        # 输出收到的文件和数据
-        logging.debug(f"Received file: {file.filename}")
-        logging.debug(f"Received data: {data}")
+        if not file_content:
+            raise HTTPException(status_code=400, detail="Either file or URL must be provided.")
 
-        if not data:
-            raise HTTPException(status_code=400, detail="Missing 'data' field in the request.")
-        
-        
-        # 读取上传文件的内容
-        stream = await file.read()
-
-        logging.debug(f"File size: {len(stream)} bytes")
-        
-        args = json.loads(data)
+        # 解析请求的额外数据
+        args = json.loads(data)  # 解析 JSON 字符串
         logging.info(f"Parsed arguments: {args}")
         
         # 生成唯一任务ID
         task_id = str(uuid.uuid4())  # 使用 UUID 生成唯一的 ID
-        tasks[task_id] = {"state": "PENDING", "info": "", "result": None}
+        tasks[task_id] = {
+            "state": "PENDING", 
+            "progress": {
+                "n": 0,  # 初始页数为 0
+                "total": 0  # 总页数还未确定
+            }, 
+            "result": None}
         args["task_id"] = task_id
-        print(args)
+        
 
-        # 启动异步任务
-        asyncio.create_task(translate_task(stream, args))
-
-        logging.debug(f"Task started with ID: {task_id}")
+        # 启动异步翻译任务
+        asyncio.create_task(translate_task(file_content, args))
         return {"id": task_id}
+        
 
     except Exception as e:
         logging.error(f"Error: {e}")
         raise HTTPException(status_code=400, detail=f"Error: {e}")
-
-
 
 @app.get("/v1/translate/{id}")
 async def get_translate_task(id: str):
@@ -114,23 +137,7 @@ async def get_translate_task(id: str):
     task = tasks.get(id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    return {"state": task["state"], "info": task["info"]}
-
-
-@app.delete("/v1/translate/{id}")
-async def delete_translate_task(id: str):
-    """
-    删除翻译任务
-    """
-    task = tasks.get(id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # 终止任务的逻辑可以加在这里
-    task["state"] = "CANCELLED"
-    return {"state": task["state"]}
-
+    return {"state": task["state"], "info": task["progress"]}
 
 @app.get("/v1/translate/{id}/{format}")
 async def get_translate_result(id: str, format: str):

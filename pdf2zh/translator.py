@@ -173,6 +173,7 @@ class BaseTranslator:
 
 
 class GoogleTranslator(BaseTranslator):
+    # 这种方式是模拟浏览器，不需要API-key，所以可以免费翻译，太牛了！
     name = "google"
     lang_map = {"zh": "zh-CN"}
 

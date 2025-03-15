@@ -15,8 +15,8 @@ import logging
 import uvicorn
 
 # 设置基本日志配置
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("uvicorn")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # 禁用 Uvicorn 的日志传播，避免重复配置
 logger.propagate = False
@@ -300,8 +300,8 @@ def main(args: Optional[List[str]] = None) -> int:
     if parsed_args.fastapi:
         from pdf2zh.backend_fastapi import app
         # 启动 FastAPI 应用
-        print(f"Starting FastAPI app on port {parsed_args.port}")
-        uvicorn.run(app, host="127.0.0.1", port=parsed_args.port, log_level="debug")  # 指定日志级别为 debug
+        logging.info(f"Starting FastAPI app on port {parsed_args.port}")
+        uvicorn.run(app, host="127.0.0.1", port=parsed_args.port, log_level="error")  # 指定日志级别为 debug
         return 0
 
     
